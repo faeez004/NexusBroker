@@ -9,6 +9,7 @@ import TickerBar from '../components/TickerBar';
 import Sparkline from '../components/Sparkline';
 import { NotificationBell } from '../components/Toast';
 import ThemeToggle from '../components/ThemeToggle';
+import MarketDemoControl from '../components/MarketDemoControl';
 
 const SECTORS = ['All', 'Banking', 'IT', 'Energy', 'FMCG', 'Pharma',
                  'Auto', 'Metals', 'Finance', 'Insurance', 'Healthcare',
@@ -73,6 +74,7 @@ export default function HomePage() {
           <NavBtn onClick={() => navigate('/dashboard')}>Portfolio</NavBtn>
           <NavBtn onClick={() => navigate('/orders')}>Orders</NavBtn>
           <NavBtn onClick={() => navigate('/wallet')}>Wallet</NavBtn>
+          <MarketDemoControl />
           <ThemeToggle/>
           <NotificationBell/>
           <button onClick={handleLogout} style={S.logoutBtn}>Logout</button>

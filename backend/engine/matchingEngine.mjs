@@ -3,17 +3,20 @@ import pool from '../config/db.mjs';
 import { OrderBook } from './orderbook.mjs';
 import { priceServer } from '../websockets/priceServer.mjs';
 
-class MatchingEngine {
-  constructor() {
+export class MatchingEngine {
+  constructor(database = pool) {
+    this.pool = database;
     this.books = new Map();
+    this.bookLocks = new Map();
 
     this.initialized = false;
+    this.pendingActivation = null;
   }
 
   async initialize() {
     console.log('[Engine] Initializing — hydrating order book from DB...');
 
-    const [instruments] = await pool.execute(
+    const [instruments] = await this.pool.execute(
       `SELECT id, symbol FROM instruments WHERE is_active = TRUE`
     );
 
@@ -21,11 +24,14 @@ class MatchingEngine {
       this.books.set(inst.id, new OrderBook(inst.id, inst.symbol));
     }
 
-    const [openOrders] = await pool.execute(
+    // Restore in-flight book state only. After-hours PENDING LIMIT orders stay
+    // in MySQL until processPendingOrders() runs at the next market open.
+    const [openOrders] = await this.pool.execute(
       `SELECT id, user_id, instrument_id, side, order_type,
                     quantity, filled_quantity, price, product_type, created_at
              FROM orders
-             WHERE status IN ('PENDING', 'PARTIAL')
+             WHERE status = 'PARTIAL'
+                OR (status = 'PENDING' AND order_type <> 'LIMIT')
              ORDER BY created_at ASC`
     );
 
@@ -57,25 +63,127 @@ class MatchingEngine {
       throw new Error('Matching engine not initialized');
     }
 
-    let book = this.books.get(order.instrumentId);
-    if (!book) {
-      book = new OrderBook(order.instrumentId, order.symbol);
-      this.books.set(order.instrumentId, book);
+    return this._withBookLock(order.instrumentId, async () => {
+      const [rows] = await this.pool.execute(
+        `SELECT status, quantity, filled_quantity
+         FROM orders
+         WHERE id = ?`,
+        [order.id]
+      );
+      const persistedOrder = rows[0];
+
+      if (!persistedOrder || !['PENDING', 'PARTIAL'].includes(persistedOrder.status)) {
+        const existingBook = this.books.get(order.instrumentId);
+        existingBook?.removeOrder(order.id, order.side);
+        return;
+      }
+
+      const remainingQty = persistedOrder.quantity - persistedOrder.filled_quantity;
+      if (remainingQty <= 0) {
+        this.books.get(order.instrumentId)?.removeOrder(order.id, order.side);
+        return;
+      }
+
+      let book = this.books.get(order.instrumentId);
+      if (!book) {
+        book = new OrderBook(order.instrumentId, order.symbol);
+        this.books.set(order.instrumentId, book);
+      }
+
+      const existingOrder = this._findBookOrder(book, order.id);
+      if (existingOrder) {
+        existingOrder.remainingQty = remainingQty;
+      } else {
+        book.addOrder({
+          id: order.id,
+          userId: order.userId,
+          side: order.side,
+          orderType: order.orderType,
+          quantity: persistedOrder.quantity,
+          remainingQty,
+          price: order.price,
+          productType: order.productType,
+          createdAt: order.createdAt,
+        });
+      }
+
+      await this._runMatchingLoop(book);
+    });
+  }
+
+  /**
+   * Activate persisted after-hours LIMIT orders (PENDING in MySQL) by sending
+   * each one through processOrder(). Safe to call more than once.
+   */
+  async processPendingOrders() {
+    if (!this.initialized) {
+      throw new Error('Matching engine not initialized');
     }
 
-    book.addOrder({
-      id: order.id,
-      userId: order.userId,
-      side: order.side,
-      orderType: order.orderType,
-      quantity: order.quantity,
-      remainingQty: order.quantity,
-      price: order.price,
-      productType: order.productType,
-      createdAt: order.createdAt,
-    });
+    if (this.pendingActivation) return this.pendingActivation;
 
-    await this._runMatchingLoop(book);
+    this.pendingActivation = this._activatePendingOrders();
+    try {
+      return await this.pendingActivation;
+    } finally {
+      this.pendingActivation = null;
+    }
+  }
+
+  async _activatePendingOrders() {
+    const [rows] = await this.pool.execute(
+      `SELECT o.id, o.user_id, o.instrument_id, o.side, o.order_type,
+              o.quantity, o.price, o.product_type, o.created_at,
+              i.symbol
+       FROM orders o
+       JOIN instruments i ON i.id = o.instrument_id
+       WHERE o.status IN ('PENDING', 'PARTIAL')
+         AND o.order_type = 'LIMIT'
+       ORDER BY o.created_at ASC`
+    );
+
+    for (const row of rows) {
+      if (row.order_type !== 'LIMIT') {
+        throw new Error(`Unexpected order type in pending LIMIT activation: ${row.order_type}`);
+      }
+
+      await this.processOrder({
+        id: row.id,
+        userId: row.user_id,
+        instrumentId: row.instrument_id,
+        symbol: row.symbol,
+        side: row.side,
+        orderType: row.order_type,
+        quantity: row.quantity,
+        price: row.price !== null ? parseInt(row.price, 10) : null,
+        productType: row.product_type,
+        createdAt: row.created_at,
+      });
+    }
+  }
+
+  _findBookOrder(book, orderId) {
+    return book.bids.find((order) => order.id === orderId)
+      || book.asks.find((order) => order.id === orderId);
+  }
+
+  async _withBookLock(instrumentId, operation) {
+    const previous = this.bookLocks.get(instrumentId) ?? Promise.resolve();
+    let release;
+    const current = new Promise((resolve) => {
+      release = resolve;
+    });
+    this.bookLocks.set(instrumentId, current);
+
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.bookLocks.get(instrumentId) === current) {
+        this.bookLocks.delete(instrumentId);
+      }
+    }
   }
 
   async _runMatchingLoop(book) {
@@ -122,10 +230,51 @@ class MatchingEngine {
   }
 
   async _settleTrade({ book, bid, ask, tradeQty, tradePrice, tradeValue }) {
-    const connection = await pool.getConnection();
+    const connection = await this.pool.getConnection();
 
     try {
       await connection.beginTransaction();
+
+      const [orderRows] = await connection.execute(
+        `SELECT id, status, quantity, filled_quantity
+         FROM orders
+         WHERE id IN (?, ?)
+         ORDER BY id
+         FOR UPDATE`,
+        [bid.id, ask.id]
+      );
+      const orderStates = new Map(orderRows.map((row) => [row.id, row]));
+      const bidState = orderStates.get(bid.id);
+      const askState = orderStates.get(ask.id);
+
+      if (
+        !bidState
+        || !askState
+        || !['PENDING', 'PARTIAL'].includes(bidState.status)
+        || !['PENDING', 'PARTIAL'].includes(askState.status)
+      ) {
+        await connection.commit();
+        if (!bidState || !['PENDING', 'PARTIAL'].includes(bidState.status)) {
+          book.removeOrder(bid.id, 'BUY');
+        }
+        if (!askState || !['PENDING', 'PARTIAL'].includes(askState.status)) {
+          book.removeOrder(ask.id, 'SELL');
+        }
+        return;
+      }
+
+      bid.remainingQty = bidState.quantity - bidState.filled_quantity;
+      ask.remainingQty = askState.quantity - askState.filled_quantity;
+      bid.quantity = bidState.quantity;
+      ask.quantity = askState.quantity;
+      tradeQty = Math.min(tradeQty, bid.remainingQty, ask.remainingQty);
+      if (tradeQty <= 0) {
+        await connection.commit();
+        if (bid.remainingQty <= 0) book.removeOrder(bid.id, 'BUY');
+        if (ask.remainingQty <= 0) book.removeOrder(ask.id, 'SELL');
+        return;
+      }
+      tradeValue = tradeQty * tradePrice;
 
       const tradeId = crypto.randomUUID();
       const now = new Date();
@@ -285,23 +434,31 @@ class MatchingEngine {
       const bidNewStatus =
         bidNewFilledQty >= bid.quantity ? 'FILLED' : 'PARTIAL';
 
-      await connection.execute(
+      const [bidUpdate] = await connection.execute(
         `UPDATE orders
                  SET filled_quantity = ?, status = ?, updated_at = NOW()
-                 WHERE id = ?`,
-        [bidNewFilledQty, bidNewStatus, bid.id]
+                 WHERE id = ? AND status IN ('PENDING', 'PARTIAL')
+                   AND filled_quantity = ?`,
+        [bidNewFilledQty, bidNewStatus, bid.id, bidState.filled_quantity]
       );
+      if (bidUpdate.affectedRows !== 1) {
+        throw new Error('Failed to update BUY order during settlement');
+      }
 
       const askNewFilledQty = ask.quantity - ask.remainingQty + tradeQty;
       const askNewStatus =
         askNewFilledQty >= ask.quantity ? 'FILLED' : 'PARTIAL';
 
-      await connection.execute(
+      const [askUpdate] = await connection.execute(
         `UPDATE orders
                  SET filled_quantity = ?, status = ?, updated_at = NOW()
-                 WHERE id = ?`,
-        [askNewFilledQty, askNewStatus, ask.id]
+                 WHERE id = ? AND status IN ('PENDING', 'PARTIAL')
+                   AND filled_quantity = ?`,
+        [askNewFilledQty, askNewStatus, ask.id, askState.filled_quantity]
       );
+      if (askUpdate.affectedRows !== 1) {
+        throw new Error('Failed to update SELL order during settlement');
+      }
 
       await connection.execute(
         `INSERT INTO trades
@@ -371,7 +528,21 @@ class MatchingEngine {
   }
 
   async cancelOrder(orderId, userId) {
-    const connection = await pool.getConnection();
+    const [rows] = await this.pool.execute(
+      `SELECT instrument_id
+       FROM orders
+       WHERE id = ? AND user_id = ?`,
+      [orderId, userId]
+    );
+    if (!rows.length) {
+      return this._cancelOrder(orderId, userId);
+    }
+
+    return this._withBookLock(rows[0].instrument_id, () => this._cancelOrder(orderId, userId));
+  }
+
+  async _cancelOrder(orderId, userId) {
+    const connection = await this.pool.getConnection();
 
     try {
       await connection.beginTransaction();
@@ -483,7 +654,7 @@ class MatchingEngine {
   }
 
 async _cancelOrderInDB(order, side) {
-    const connection = await pool.getConnection();
+    const connection = await this.pool.getConnection();
 
     try {
         await connection.beginTransaction();

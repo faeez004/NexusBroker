@@ -1,14 +1,40 @@
 import pool from "../config/db.mjs";
 import crypto from "crypto";
 import { engine } from '../engine/matchingEngine.mjs';
+import { getOrderMarketAction } from '../market/marketClock.mjs';
 
 const MAX_RETRIES = 3;
 const RETRYABLE_ERRORS = new Set(["ER_DEADLOCK", "ER_LOCK_WAIT_TIMEOUT"]);
+
+function scheduleOrderProcessing(order, side) {
+    setImmediate(async () => {
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                await engine.processOrder(order);
+                return;
+            } catch (err) {
+                if (attempt === MAX_RETRIES) {
+                    console.error(`[Engine] ${side} order ${order.id} failed after ${attempt} processing attempts:`, err);
+                    return;
+                }
+
+                console.error(`[Engine] ${side} order ${order.id} processing attempt ${attempt} failed; retrying:`, err);
+                await new Promise(resolve => setTimeout(resolve, 100 * (2 ** (attempt - 1))));
+            }
+        }
+    });
+}
 
 export const placeOrder = async (req, res, next) => {
     const { instrument_id, side, order_type, quantity, price, product_type } = req.body;
     const userId = req.userId;
     const orderId = crypto.randomUUID();
+
+    if (getOrderMarketAction(order_type) === 'REJECT_MARKET') {
+        return res.status(400).json({
+            error: 'MARKET orders cannot be placed while the market is closed. Place a LIMIT order to queue it for the next session, or retry when the market is open.',
+        });
+    }
 
     let attempt = 0;
     let lastError = null;
@@ -111,11 +137,21 @@ export const placeOrder = async (req, res, next) => {
                     [orderId, userId, instrument_id, order_type, quantity,
                      order_type === 'MARKET' ? null : price, product_type, reservationAmount]
                 );
-            
+
+                // This check defines admission; the clock cannot be made atomic with COMMIT.
+                const admissionAction = getOrderMarketAction(order_type);
+                if (admissionAction === 'REJECT_MARKET') {
+                    await connection.rollback();
+                    return res.status(400).json({
+                        error: 'MARKET orders cannot be placed while the market is closed. Place a LIMIT order to queue it for the next session, or retry when the market is open.',
+                    });
+                }
+                const admittedWhileOpen = admissionAction === 'PROCESS';
+
                 await connection.commit();
-            
-                setImmediate(() => {
-                    engine.processOrder({
+
+                if (admittedWhileOpen) {
+                    scheduleOrderProcessing({
                         id:           orderId,
                         userId,
                         instrumentId: instrument_id,
@@ -126,8 +162,8 @@ export const placeOrder = async (req, res, next) => {
                         price:        order_type === 'MARKET' ? null : price,
                         productType:  product_type,
                         createdAt:    new Date(),
-                    }).catch(err => console.error('[Engine] BUY processing error:', err));
-                });
+                    });
+                }
             
                 return res.status(201).json({
                     message: "BUY order placed successfully.",
@@ -195,22 +231,31 @@ export const placeOrder = async (req, res, next) => {
                     ]
                 );
 
+                const admissionAction = getOrderMarketAction(order_type);
+                if (admissionAction === 'REJECT_MARKET') {
+                    await connection.rollback();
+                    return res.status(400).json({
+                        error: 'MARKET orders cannot be placed while the market is closed. Place a LIMIT order to queue it for the next session, or retry when the market is open.',
+                    });
+                }
+                const admittedWhileOpen = admissionAction === 'PROCESS';
+
                 await connection.commit();
 
-                setImmediate(() => {
-                engine.processOrder({
-                    id: orderId,
-                    userId,
-                    instrumentId: instrument_id,
-                    symbol: instrument.symbol,
-                    side: 'SELL',
-                    orderType: order_type,
-                    quantity,
-                    price: order_type==='MARKET' ? null : price,
-                    productType: product_type,
-                    createdAt: new Date(),
-                }).catch(err => console.error('[Engine] SELL processing error:', err));
-            });
+                if (admittedWhileOpen) {
+                    scheduleOrderProcessing({
+                        id: orderId,
+                        userId,
+                        instrumentId: instrument_id,
+                        symbol: instrument.symbol,
+                        side: 'SELL',
+                        orderType: order_type,
+                        quantity,
+                        price: order_type==='MARKET' ? null : price,
+                        productType: product_type,
+                        createdAt: new Date(),
+                    });
+                }
 
                 return res.status(201).json({
                     message: "SELL order placed successfully.",

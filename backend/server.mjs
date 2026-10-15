@@ -13,6 +13,9 @@ import walletRoutes from './routes/walletRoutes.mjs';
 import bankAccountRoutes from "./routes/bankAccountRoutes.mjs";
 import orderRoutes from "./routes/orderRoutes.mjs";
 import { engine } from './engine/matchingEngine.mjs';
+import { startMarketScheduler, stopMarketScheduler } from './market/marketScheduler.mjs';
+import { MARKET_DEMO_MODE_ENABLED } from './market/marketClock.mjs';
+import { createMarketDemoRouter } from './routes/marketDemoRoutes.mjs';
 import { priceServer } from './websockets/priceServer.mjs';
 import { priceSimulator } from './websockets/priceSimulator.mjs';
 import portfolioRoutes from './routes/portfolioRoutes.mjs';
@@ -50,6 +53,11 @@ app.use("/api/orders", orderRoutes);
 app.use('/api/portfolio', portfolioRoutes);
 app.use('/api/instruments', instrumentRoutes);
 
+if (MARKET_DEMO_MODE_ENABLED) {
+  app.use('/api/debug/market-demo', createMarketDemoRouter({
+    enabled: MARKET_DEMO_MODE_ENABLED,
+  }));
+}
 
 // Debug: see what's in the order book right now
 app.get('/api/debug/orderbook/:symbol', async (req, res) => {
@@ -117,6 +125,7 @@ engine.initialize()
   .then(() => {
     priceServer.getFallbackPrice = (symbol) => priceSimulator.getPrice(symbol);
     priceSimulator.start(1500);   // tick every 1.5 seconds
+    startMarketScheduler();
     httpServer.listen(PORT, () => {
       console.log(`[Nexus Broker] HTTP + WebSocket running on port ${PORT}`);
       console.log('[Engine] Order matching engine active.');
@@ -127,3 +136,16 @@ engine.initialize()
         console.error('[Engine] Failed to initialize:', err);
         process.exit(1);
     });
+
+let shuttingDown = false;
+
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  await stopMarketScheduler();
+  priceSimulator.stop();
+  process.exit(0);
+}
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

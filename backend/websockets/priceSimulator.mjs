@@ -1,4 +1,5 @@
 import pool from '../config/db.mjs';
+import { isMarketOpen } from '../market/marketClock.mjs';
 import { priceServer } from './priceServer.mjs';
 
 function nextPrice(currentPaise, volatility = 0.002) {
@@ -88,6 +89,7 @@ class PriceSimulator {
       if (!this.prices.has(name)) this.prices.set(name, price);
     }
     this.interval = setInterval(() => {
+      if (!isMarketOpen()) return;
 
       for (const [symbol, subscribers] of priceServer.subscriptions) {
         if (subscribers.size === 0) continue;

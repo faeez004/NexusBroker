@@ -9,6 +9,7 @@ import TickerBar from '../components/TickerBar';
 import { onEvent, AppEvents } from '../utils/events';
 import { NotificationBell } from '../components/Toast';
 import ThemeToggle from '../components/ThemeToggle';
+import MarketDemoControl from '../components/MarketDemoControl';
 
 export default function DashboardPage() {
   const [portfolio, setPortfolio]     = useState(null);
@@ -96,6 +97,7 @@ export default function DashboardPage() {
           <NavButton to="/"  label="Markets"  navigate={navigate} />
           <NavButton to="/orders" label="Orders" navigate={navigate} />
           <NavButton to="/wallet" label="Wallet" navigate={navigate} />
+          <MarketDemoControl />
           <ThemeToggle/>
           <NotificationBell/>
           <button onClick={handleLogout} style={S.logoutBtn}>Logout</button>
