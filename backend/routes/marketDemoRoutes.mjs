@@ -1,29 +1,17 @@
-import { isIP } from 'node:net';
 import { Router } from 'express';
 import {
   getMarketStatus,
   setDemoMarketState,
 } from '../market/marketClock.mjs';
 import { startMarketScheduler } from '../market/marketScheduler.mjs';
-
-export function isLocalClientAddress(address) {
-  if (!address || !isIP(address)) return false;
-  if (address === '::1') return true;
-  if (address.startsWith('::ffff:')) {
-    return isLocalClientAddress(address.slice('::ffff:'.length));
-  }
-  return address.startsWith('127.');
-}
+import { verifyAccessToken } from '../middleware/verifyAccessToken.mjs';
 
 export function createMarketDemoRouter({
   enabled,
-  nodeEnv = process.env.NODE_ENV,
+  operatorId = process.env.MARKET_DEMO_OPERATOR_ID,
   marketProvider = { getMarketStatus, setDemoMarketState },
   getScheduler = startMarketScheduler,
 } = {}) {
-  if (enabled && nodeEnv?.toLowerCase() === 'production') {
-    throw new Error('The market demo control route is unavailable in production.');
-  }
   if (!enabled) {
     throw new Error('The market demo control route requires MARKET_DEMO_MODE=true.');
   }
@@ -31,9 +19,9 @@ export function createMarketDemoRouter({
   const router = Router();
   let transition = Promise.resolve();
 
-  router.use((req, res, next) => {
-    if (!isLocalClientAddress(req.socket.remoteAddress)) {
-      return res.status(403).json({ error: 'Market demo controls are local-only.' });
+  router.use(verifyAccessToken, (req, res, next) => {
+    if (!operatorId || req.userId !== operatorId) {
+      return res.status(403).json({ error: 'Market demo operator access required.' });
     }
     next();
   });

@@ -10,7 +10,7 @@ A production-grade stock trading platform built from scratch — inspired by Zer
 ## Features
 - Custom order matching engine with price-time priority and partial fills
 - Market-timing rules for regular Indian market hours (Monday–Friday, 9:15 AM–3:30 PM IST)
-- Development-only market demo controls for switching OPEN/CLOSED without changing the computer clock
+- Controlled market-demo overrides for switching OPEN/CLOSED without changing the computer clock
 - Real-time price feed via WebSocket (50 NSE instruments + synthetic indices)
 - Geometric Brownian Motion price simulator (same model as Black-Scholes)
 - ACID transactions for all money movement — no float bugs (integer paise)
@@ -90,31 +90,33 @@ Simulated stock and index prices update only while the market is open and freeze
 
 When the market opens, the scheduler selects persisted pending LIMIT orders and submits them through the existing matching engine. An order that does not cross an opposing order rests on the book and may continue to show `PENDING`; activation does not guarantee a fill. The displayed simulated last-traded price is not a counterparty order.
 
-### Development-only market demo mode
+### Controlled market demo mode
 
-Demo mode manually overrides market OPEN/CLOSED state so the flow can be demonstrated outside real market hours. It is enabled only by an explicit backend setting and is refused when `NODE_ENV=production`. The frontend controls require a separate Vite development-mode setting; both backend and frontend development servers must be restarted after editing their `.env` files.
+Demo mode manually overrides market OPEN/CLOSED state so the flow can be demonstrated outside real market hours. These controls are intended for a controlled demonstration. The backend route is unavailable unless `MARKET_DEMO_MODE=true`; it also requires an authenticated user whose database ID matches `MARKET_DEMO_OPERATOR_ID`. The frontend controls are included only when `VITE_MARKET_DEMO_MODE=true` is set at build time. This explicit configuration also permits a controlled production demonstration; there is no local-IP restriction.
 
-In `backend/.env`, set:
+In `backend/.env`, set the backend opt-in and the database ID of the account authorized to operate the controls:
 
 ```dotenv
-NODE_ENV=development
 MARKET_DEMO_MODE=true
+MARKET_DEMO_OPERATOR_ID=your_operator_user_id
 ```
 
-In `frontend/.env`, set:
+`MARKET_DEMO_OPERATOR_ID` must match the authenticated account's `user_profiles.id`. Leave it unset to deny operator access.
+
+Set the frontend flag when building the frontend (including production builds):
 
 ```dotenv
 VITE_MARKET_DEMO_MODE=true
 ```
 
-Log in to the local frontend and use the **OPEN** and **CLOSED** controls in the Markets or Portfolio navigation bar. CLOSED rejects new MARKET orders and queues new LIMIT orders as `PENDING`. OPEN waits for the current queued LIMIT activation attempt to complete; a failed activation is reported as an error and remains eligible for retry. Each CLOSED→OPEN transition activates a new demo cycle, even on the same date.
+Log in as the configured operator and use the **OPEN** and **CLOSED** controls in the Markets or Portfolio navigation bar. CLOSED rejects new MARKET orders and queues new LIMIT orders as `PENDING`. OPEN waits for the current queued LIMIT activation attempt to complete; a failed activation is reported as an error and remains eligible for retry. Each CLOSED→OPEN transition activates a new demo cycle, even on the same date.
 
-The control API is available only when `MARKET_DEMO_MODE=true` and only to loopback clients:
+The control API is available only when `MARKET_DEMO_MODE=true` and only to authenticated requests whose user ID matches `MARKET_DEMO_OPERATOR_ID`:
 
 - `GET /api/debug/market-demo` — read current state.
 - `POST /api/debug/market-demo` with `{"state":"OPEN"}` or `{"state":"CLOSED"}` — change state.
 
-This is a single-process, in-memory override. Restarting the backend resets the override to the real-clock default; it is not coordinated across multiple server instances. Never enable it in production.
+This is a single-process, in-memory override. Restarting the backend resets the override to the real-clock default; it is not coordinated across multiple server instances. Keep it limited to a controlled demonstration and use a single backend instance while it is enabled.
 
 ### Testing market timing
 
@@ -144,14 +146,14 @@ The debug order-book endpoint is unavailable in production. Do not use the `seed
 **WebSocket Architecture:** One connection per user, pub-sub broker pattern inside React Context, auto-reconnect with exponential backoff.
 
 ## API Reference
-See `/health` for service status. Application endpoints require JWT via httpOnly cookie except `/api/auth/register` and `/api/auth/login`; development debug endpoints are exceptions and should only be used locally.
+See `/health` for service status. Application endpoints require JWT via httpOnly cookie except `/api/auth/register` and `/api/auth/login`. Debug endpoint availability is route-specific; the market-demo endpoints require explicit backend enablement and authenticated operator authorization.
 
 ## Running Tests
 ```bash
 cd backend
-node test/master_test.mjs
+npm test
 ```
-The integration suite requires the backend server and a correctly configured test database. The package `npm test` script is currently a placeholder; use the command above for the integration suite and `node --test test/marketTiming.test.mjs` for focused market-timing coverage.
+`npm test` runs the automated `test/marketTiming.test.mjs` suite. It does not run `test/master_test.mjs`, which truncates tables in its configured database, or `test/test-race.mjs` and `test/thundering_herd.mjs`, which require a live server and create database writes or stress traffic. Run those scripts only as deliberate manual tests with a disposable database and server.
 
 ## Market Simulation Limitations
 - There is no exchange holiday calendar or support for special/extended sessions; the schedule is weekday-only.

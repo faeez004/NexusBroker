@@ -1,8 +1,7 @@
 import { useEffect, useState } from 'react';
 import { apiFetch } from '../hooks/useApi';
 
-const DEMO_CONTROLS_ENABLED = import.meta.env.DEV
-  && import.meta.env.VITE_MARKET_DEMO_MODE === 'true';
+const DEMO_CONTROLS_ENABLED = import.meta.env.VITE_MARKET_DEMO_MODE === 'true';
 
 export default function MarketDemoControl() {
   const [status, setStatus] = useState(null);

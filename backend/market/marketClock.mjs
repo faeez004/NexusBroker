@@ -42,19 +42,10 @@ function isRegularMarketOpen(now) {
   return t >= OPEN_SECONDS && t < CLOSE_SECONDS;
 }
 
-function isProduction(nodeEnv) {
-  return nodeEnv?.toLowerCase() === 'production';
-}
-
 export function createMarketStateProvider({
   demoEnabled = false,
-  nodeEnv = process.env.NODE_ENV,
   clock = () => new Date(),
 } = {}) {
-  if (demoEnabled && isProduction(nodeEnv)) {
-    throw new Error('MARKET_DEMO_MODE cannot be enabled in production.');
-  }
-
   let demoOverride = null;
   let activationCycle = 0;
 

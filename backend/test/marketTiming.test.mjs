@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import cookieParser from 'cookie-parser';
 import express from 'express';
 import { createServer } from 'node:http';
+import jwt from 'jsonwebtoken';
 import test, { after } from 'node:test';
 import pool from '../config/db.mjs';
 import { MatchingEngine } from '../engine/matchingEngine.mjs';
@@ -12,12 +14,11 @@ import {
   getIstTradingDate,
   isMarketOpen,
 } from '../market/marketClock.mjs';
-import {
-  createMarketDemoRouter,
-  isLocalClientAddress,
-} from '../routes/marketDemoRoutes.mjs';
+import { createMarketDemoRouter } from '../routes/marketDemoRoutes.mjs';
 
 const openTime = new Date('2026-10-15T03:45:00.000Z');
+const testAccessTokenSecret = 'market-demo-test-secret';
+process.env.ACCESS_TOKEN_SECRET = testAccessTokenSecret;
 
 after(async () => {
   await pool.end();
@@ -100,6 +101,21 @@ function makeDatabase(order, { statusReadGate } = {}) {
   };
 }
 
+function authCookie(userId) {
+  return `ACCESS_TOKEN=${jwt.sign({}, testAccessTokenSecret, { subject: userId })}`;
+}
+
+function requestOptions(userId, options = {}) {
+  return {
+    ...options,
+    headers: {
+      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(userId ? { Cookie: authCookie(userId) } : {}),
+      ...options.headers,
+    },
+  };
+}
+
 test('market clock enforces IST boundaries and weekdays', () => {
   const cases = [
     ['2026-10-15T03:44:59.000Z', false],
@@ -119,7 +135,6 @@ test('market clock enforces IST boundaries and weekdays', () => {
 test('market demo provider preserves real clock until overridden and cycles on reopening', () => {
   const provider = createMarketStateProvider({
     demoEnabled: true,
-    nodeEnv: 'development',
     clock: () => new Date('2026-10-15T03:44:59.000Z'),
   });
 
@@ -137,27 +152,25 @@ test('market demo provider preserves real clock until overridden and cycles on r
   assert.equal(provider.getActivationKey(), 'demo:2');
 });
 
-test('market demo provider and route refuse production enablement', () => {
-  assert.throws(
-    () => createMarketStateProvider({ demoEnabled: true, nodeEnv: 'production' }),
-    /cannot be enabled in production/,
+test('market demo requires opt-in and supports production demonstration', () => {
+  assert.doesNotThrow(
+    () => createMarketStateProvider({ demoEnabled: true }),
+  );
+  assert.doesNotThrow(
+    () => createMarketDemoRouter({ enabled: true }),
   );
   assert.throws(
-    () => createMarketDemoRouter({ enabled: true, nodeEnv: 'production' }),
-    /unavailable in production/,
+    () => createMarketDemoRouter({ enabled: false }),
+    /requires MARKET_DEMO_MODE=true/,
   );
   assert.throws(
     () => createMarketStateProvider({ demoEnabled: false }).setDemoMarketState('OPEN'),
     /demo mode is disabled/,
   );
-  assert.equal(isLocalClientAddress('127.0.0.1'), true);
-  assert.equal(isLocalClientAddress('::1'), true);
-  assert.equal(isLocalClientAddress('::ffff:127.0.0.1'), true);
-  assert.equal(isLocalClientAddress('192.0.2.20'), false);
 
   const startupCheck = spawnSync(
     process.execPath,
-    ['--input-type=module', '-e', "import('./market/marketClock.mjs')"],
+    ['--input-type=module', '-e', "import('./market/marketClock.mjs').then(({ MARKET_DEMO_MODE_ENABLED }) => console.log(MARKET_DEMO_MODE_ENABLED))"],
     {
       cwd: new URL('..', import.meta.url),
       env: {
@@ -168,14 +181,13 @@ test('market demo provider and route refuse production enablement', () => {
       encoding: 'utf8',
     },
   );
-  assert.notEqual(startupCheck.status, 0);
-  assert.match(startupCheck.stderr, /MARKET_DEMO_MODE cannot be enabled in production/);
+  assert.equal(startupCheck.status, 0, startupCheck.stderr);
+  assert.match(startupCheck.stdout, /true/);
 });
 
-test('localhost demo endpoint switches state and activates every open cycle', async (t) => {
+test('demo endpoint requires the configured operator and switches state for that operator', async (t) => {
   const marketProvider = createMarketStateProvider({
     demoEnabled: true,
-    nodeEnv: 'development',
     clock: () => new Date('2026-10-15T03:44:59.000Z'),
   });
   let activations = 0;
@@ -186,9 +198,10 @@ test('localhost demo endpoint switches state and activates every open cycle', as
   });
   const app = express();
   app.use(express.json());
+  app.use(cookieParser());
   app.use('/', createMarketDemoRouter({
     enabled: true,
-    nodeEnv: 'development',
+    operatorId: 'operator-1',
     marketProvider,
     getScheduler: () => scheduler,
   }));
@@ -202,50 +215,81 @@ test('localhost demo endpoint switches state and activates every open cycle', as
   });
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
 
-  const initial = await fetch(baseUrl).then((response) => response.json());
+  const unauthenticatedGet = await fetch(baseUrl);
+  assert.equal(unauthenticatedGet.status, 401);
+  const unauthenticatedPost = await fetch(baseUrl, requestOptions(null, {
+    method: 'POST',
+    body: JSON.stringify({ state: 'OPEN' }),
+  }));
+  assert.equal(unauthenticatedPost.status, 401);
+
+  const unauthorizedGet = await fetch(baseUrl, requestOptions('user-2'));
+  assert.equal(unauthorizedGet.status, 403);
+  const unauthorizedPost = await fetch(baseUrl, requestOptions('user-2', {
+    method: 'POST',
+    body: JSON.stringify({ state: 'OPEN' }),
+  }));
+  assert.equal(unauthorizedPost.status, 403);
+  assert.equal(marketProvider.getMarketStatus().state, 'CLOSED');
+
+  const initial = await fetch(baseUrl, requestOptions('operator-1')).then((response) => response.json());
   assert.equal(initial.data.state, 'CLOSED');
 
-  const closed = await fetch(baseUrl, {
+  const closed = await fetch(baseUrl, requestOptions('operator-1', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ state: 'CLOSED' }),
-  });
+  }));
   assert.equal(closed.status, 200);
   assert.equal(activations, 0);
 
-  const opened = await fetch(baseUrl, {
+  const opened = await fetch(baseUrl, requestOptions('operator-1', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ state: 'OPEN' }),
-  }).then((response) => response.json());
+  })).then((response) => response.json());
   assert.equal(opened.activation, 'completed');
   assert.equal(activations, 1);
 
-  await fetch(baseUrl, {
+  await fetch(baseUrl, requestOptions('operator-1', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ state: 'CLOSED' }),
-  });
-  const reopened = await fetch(baseUrl, {
+  }));
+  const reopened = await fetch(baseUrl, requestOptions('operator-1', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ state: 'OPEN' }),
-  }).then((response) => response.json());
+  })).then((response) => response.json());
   assert.equal(reopened.activation, 'completed');
   assert.equal(activations, 2);
 
-  const invalid = await fetch(baseUrl, {
+  const invalid = await fetch(baseUrl, requestOptions('operator-1', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ state: 'HALTED' }),
-  });
+  }));
   assert.equal(invalid.status, 400);
+});
+
+test('demo endpoint fails closed when no operator ID is configured', async (t) => {
+  const app = express();
+  app.use(cookieParser());
+  app.use('/', createMarketDemoRouter({
+    enabled: true,
+    operatorId: '',
+    marketProvider: { getMarketStatus: () => ({ state: 'CLOSED' }) },
+  }));
+  const server = createServer(app);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+  });
+
+  const response = await fetch(`http://127.0.0.1:${server.address().port}`, requestOptions('operator-1'));
+  assert.equal(response.status, 403);
 });
 
 test('demo endpoint reports activation failures without claiming success', async (t) => {
   const marketProvider = createMarketStateProvider({
     demoEnabled: true,
-    nodeEnv: 'development',
     clock: () => new Date('2026-10-15T03:44:59.000Z'),
   });
   const scheduler = createMarketScheduler({
@@ -255,9 +299,10 @@ test('demo endpoint reports activation failures without claiming success', async
   });
   const app = express();
   app.use(express.json());
+  app.use(cookieParser());
   app.use('/', createMarketDemoRouter({
     enabled: true,
-    nodeEnv: 'development',
+    operatorId: 'operator-1',
     marketProvider,
     getScheduler: () => scheduler,
   }));
@@ -270,11 +315,10 @@ test('demo endpoint reports activation failures without claiming success', async
     });
   });
 
-  const response = await fetch(`http://127.0.0.1:${server.address().port}`, {
+  const response = await fetch(`http://127.0.0.1:${server.address().port}`, requestOptions('operator-1', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ state: 'OPEN' }),
-  });
+  }));
   const body = await response.json();
   assert.equal(response.status, 503);
   assert.equal(body.data.state, 'OPEN');
@@ -284,7 +328,6 @@ test('demo endpoint reports activation failures without claiming success', async
 test('CLOSED transition waits until the opening activation finishes', async (t) => {
   const marketProvider = createMarketStateProvider({
     demoEnabled: true,
-    nodeEnv: 'development',
     clock: () => new Date('2026-10-15T03:44:59.000Z'),
   });
   let startActivation;
@@ -305,9 +348,10 @@ test('CLOSED transition waits until the opening activation finishes', async (t) 
   });
   const app = express();
   app.use(express.json());
+  app.use(cookieParser());
   app.use('/', createMarketDemoRouter({
     enabled: true,
-    nodeEnv: 'development',
+    operatorId: 'operator-1',
     marketProvider,
     getScheduler: () => scheduler,
   }));
@@ -321,17 +365,15 @@ test('CLOSED transition waits until the opening activation finishes', async (t) 
   });
 
   const url = `http://127.0.0.1:${server.address().port}`;
-  const openRequest = fetch(url, {
+  const openRequest = fetch(url, requestOptions('operator-1', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ state: 'OPEN' }),
-  });
+  }));
   await activationStarted;
-  const closeRequest = fetch(url, {
+  const closeRequest = fetch(url, requestOptions('operator-1', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ state: 'CLOSED' }),
-  });
+  }));
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(marketProvider.getMarketStatus().state, 'OPEN');
 
